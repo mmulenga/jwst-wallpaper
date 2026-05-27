@@ -46,10 +46,16 @@ def search_observations(
 ) -> Table:
     """Return a table of JWST observations matching *target*.
 
+    Uses ``query_object`` (Sesame name resolver) so common names like
+    ``"Carina Nebula"`` or ``"Pillars of Creation"`` work without knowing the
+    exact MAST target_name string.  Falls back to a wildcard ``query_criteria``
+    search if the resolver returns nothing.
+
     Parameters
     ----------
     target:
-        Object name or coordinates string accepted by MAST (e.g. ``"Carina Nebula"``).
+        Object name accepted by the CDS Sesame name resolver, or a wildcard
+        string for MAST (e.g. ``"*carina*"``).
     instrument:
         JWST instrument name: ``NIRCam``, ``MIRI``, ``NIRSpec``, or ``NIRISS``.
     max_results:
@@ -58,22 +64,60 @@ def search_observations(
     Returns
     -------
     astropy.table.Table
-        Observations table with columns including ``obsid``, ``target_name``,
-        ``t_exptime``, ``filters``, and ``dataURL``.
+        Observations table.
     """
     console.print(f"[bold cyan]Searching MAST[/] for [yellow]{target}[/] ({instrument})…")
-    obs = Observations.query_criteria(
-        target_name=target,
-        obs_collection="JWST",
-        instrument_name=instrument,
-        dataproduct_type="IMAGE",
-    )
-    if obs is None or len(obs) == 0:
-        return Table()
 
-    # Sort by exposure time (longest first — most detail)
-    obs.sort("t_exptime", reverse=True)
-    return obs[:max_results]
+    # --- Strategy 1: Sesame name resolver (handles common object names) ------
+    try:
+        obs = Observations.query_object(
+            target,
+            radius="5 arcmin",
+        )
+        if obs is not None and len(obs) > 0:
+            # instrument_name in MAST is like "NIRCAM/IMAGE" — use substring match
+            instr_upper = instrument.upper().replace("NIR", "NIR")  # normalise
+            mask = (
+                (obs["obs_collection"] == "JWST")
+                & ([instr_upper in str(v).upper() for v in obs["instrument_name"]])
+                & (obs["dataproduct_type"] == "image")
+                & ([str(r).upper() in ("PUBLIC", "OPEN")
+                    for r in obs["dataRights"]])
+            )
+            filtered = obs[mask]
+            if len(filtered) > 0:
+                filtered.sort("t_exptime", reverse=True)
+                return filtered[:max_results]
+            # If everything is proprietary, warn but still return for the error msg
+            jwst_mask = (
+                (obs["obs_collection"] == "JWST")
+                & ([instr_upper in str(v).upper() for v in obs["instrument_name"]])
+            )
+            if obs[jwst_mask] is not None and len(obs[jwst_mask]) > 0:
+                console.print(
+                    f"  [yellow]Found {len(obs[jwst_mask])} JWST observation(s) but all are "
+                    f"proprietary. Try a different target or provide a MAST token.[/]"
+                )
+    except Exception as exc:
+        console.print(f"  [dim]query_object failed ({exc}), trying wildcard…[/]")
+
+    # --- Strategy 2: Wildcard target_name match (public only) ----------------
+    wildcard = f"*{target.replace(' ', '*')}*"
+    try:
+        obs = Observations.query_criteria(
+            target_name=wildcard,
+            obs_collection="JWST",
+            instrument_name=f"*{instrument.upper()}*",
+            dataproduct_type="image",
+            dataRights="PUBLIC",
+        )
+        if obs is not None and len(obs) > 0:
+            obs.sort("t_exptime", reverse=True)
+            return obs[:max_results]
+    except Exception:
+        pass
+
+    return Table()
 
 
 def search_by_coordinates(
@@ -117,6 +161,10 @@ def search_by_coordinates(
 def get_best_products(obs_table: Table, prefer_i2d: bool = True) -> Table:
     """Retrieve data products for a set of observations, preferring i2d images.
 
+    Only returns products from *public* observations (``dataRights == 'PUBLIC'``
+    or ``dataRights == 'OPEN'``).  Proprietary data requires a MAST auth token;
+    see ``--mast-token`` if you have one.
+
     Parameters
     ----------
     obs_table:
@@ -127,6 +175,18 @@ def get_best_products(obs_table: Table, prefer_i2d: bool = True) -> Table:
     """
     if len(obs_table) == 0:
         return Table()
+
+    # Filter observations to those that are publicly accessible
+    if "dataRights" in obs_table.colnames:
+        pub_mask = [str(r).upper() in ("PUBLIC", "OPEN") for r in obs_table["dataRights"]]
+        public_obs = obs_table[pub_mask]
+        if len(public_obs) == 0:
+            console.print("[yellow]All matched observations are proprietary. "
+                          "Try --mast-token or a different target.[/]")
+            return Table()
+        if len(public_obs) < len(obs_table):
+            console.print(f"  [dim]{len(obs_table) - len(public_obs)} proprietary observation(s) skipped.[/]")
+        obs_table = public_obs
 
     products = Observations.get_product_list(obs_table)
     # Filter to science data only
@@ -190,40 +250,64 @@ def download_products(
         console.print("[yellow]No matching products to download.[/]")
         return []
 
-    downloaded: list[Path] = []
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        for row in products:
-            filename: str = row["productFilename"]
-            dest_path = dest_dir / filename
+    # Check which files are already cached
+    already: list[Path] = []
+    to_download = []
+    for row in products:
+        dest_path = dest_dir / str(row["productFilename"])
+        if dest_path.exists():
+            console.print(f"  [dim]Cached[/] {row['productFilename']}")
+            already.append(dest_path)
+        else:
+            to_download.append(row)
 
-            if dest_path.exists():
-                console.print(f"  [dim]Cached[/] {filename}")
-                downloaded.append(dest_path)
-                continue
+    if not to_download:
+        return already
 
-            task = progress.add_task(f"[cyan]{filename}", total=None)
-            try:
-                result = Observations.download_file(
-                    f"mast:{row['dataURI']}",
-                    local_path=str(dest_path),
-                )
-                if result[0] == "COMPLETE":
-                    downloaded.append(dest_path)
-                    progress.update(task, description=f"[green]✓[/] {filename}")
-                else:
-                    console.print(f"  [red]Failed[/] {filename}: {result[1]}")
-            except Exception as exc:
-                console.print(f"  [red]Error[/] {filename}: {exc}")
-            finally:
-                progress.remove_task(task)
+    # Use the bulk downloader — it handles auth, retries, and flat file layout
+    from astropy.table import vstack
+    to_dl_table = products[[
+        str(r["productFilename"]) in {str(x["productFilename"]) for x in to_download}
+        for r in products
+    ]]
+
+    console.print(f"Downloading [bold]{len(to_dl_table)}[/] file(s)…")
+    try:
+        manifest = Observations.download_products(
+            to_dl_table,
+            download_dir=str(dest_dir),
+            flat=True,  # put all files directly in dest_dir (no mastDownload/ nesting)
+        )
+    except TypeError:
+        # Older astroquery versions don't support flat=
+        manifest = Observations.download_products(
+            to_dl_table,
+            download_dir=str(dest_dir),
+        )
+
+    downloaded: list[Path] = list(already)
+    if manifest is not None:
+        for row in manifest:
+            status = str(row.get("Status", row.get("status", ""))).upper()
+            local = row.get("Local Path", row.get("local_path", ""))
+            if status == "COMPLETE" and local:
+                p = Path(str(local))
+                if not p.exists():
+                    # flat=False puts files under mastDownload/JWST/<obsid>/
+                    # search for the filename anywhere under dest_dir
+                    matches = list(dest_dir.rglob(p.name))
+                    if matches:
+                        p = matches[0]
+                if p.exists():
+                    # Move to flat dest_dir if nested
+                    flat_dest = dest_dir / p.name
+                    if p != flat_dest:
+                        p.rename(flat_dest)
+                        p = flat_dest
+                    downloaded.append(p)
+                    console.print(f"  [green]✓[/] {p.name}")
+            else:
+                console.print(f"  [red]Failed[/] {local}: {status}")
 
     return downloaded
 
@@ -250,6 +334,15 @@ def fetch(
 
     console.print(f"Found [bold]{len(obs)}[/] observations.")
     products = get_best_products(obs)
-    console.print(f"Found [bold]{len(products)}[/] science products.")
+    # Cap to one i2d file per observation so we don't flood the cache
+    cap = max_observations * 2
+    if len(products) > cap:
+        console.print(
+            f"Found [bold]{len(products)}[/] science products — "
+            f"downloading the first [bold]{cap}[/] (one per detector/filter)."
+        )
+        products = products[:cap]
+    else:
+        console.print(f"Found [bold]{len(products)}[/] science products.")
 
     return download_products(products, dest_dir, filters=filters)
