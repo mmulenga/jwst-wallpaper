@@ -497,12 +497,16 @@ def fetch(
 # Each tuple is (red_filter, green_filter, blue_filter) by wavelength.
 # Wavelength encoded in filter name: F444W = 4.44 µm, F090W = 0.90 µm.
 _NIRCAM_RGB_PRESETS: list[tuple[str, str, str]] = [
+    # Wide-wavelength (SW+LW) — best colour separation, but SW files are ~5 GB
     ("F444W", "F277W", "F090W"),   # classic deep-field palette (Cosmic Cliffs etc.)
     ("F444W", "F277W", "F115W"),   # good when F090W not observed
     ("F356W", "F200W", "F090W"),   # shorter wavelengths — bluer result
     ("F444W", "F335M", "F115W"),   # medium-band for sharper colour contrast
     ("F470N", "F335M", "F187N"),   # narrow-band Pillars-of-Creation palette
     ("F444W", "F277W", "F150W"),   # alternative blue substitution
+    # Long-wavelength only — all ~900 MB; great for nebulae with H2 / PAH emission
+    ("F444W", "F335M", "F470N"),   # LW trio: warm dust / PAHs / H2 (Carina, M16)
+    ("F444W", "F356W", "F335M"),   # LW broadband trio
 ]
 
 _MIRI_RGB_PRESETS: list[tuple[str, str, str]] = [
@@ -552,6 +556,8 @@ def fetch_rgb_set(
     dest_dir: Path,
     instrument: str = "NIRCam",
     max_observations: int = 10,
+    max_size_mb: int = 1000,
+    search_radius_arcmin: float = 20.0,
 ) -> Optional[tuple[Path, Path, Path]]:
     """Fetch a three-filter set for *target* and return (red, green, blue) paths.
 
@@ -563,7 +569,7 @@ def fetch_rgb_set(
     """
     presets = _MIRI_RGB_PRESETS if "miri" in instrument.lower() else _NIRCAM_RGB_PRESETS
 
-    # Find observations
+    # Find observations — try name, then Simbad+coordinates with a tight radius
     obs = search_observations(target, instrument=instrument, max_results=max_observations)
     if len(obs) == 0:
         console.print(f"[dim]No results by name — trying Simbad resolution for '{target}'…[/]")
@@ -576,7 +582,14 @@ def fetch_rgb_set(
             return None
         ra, dec = coords
         console.print(f"[dim]Resolved to RA={ra:.4f} Dec={dec:.4f}[/]")
-        obs = search_by_coordinates(ra, dec, instrument=instrument, max_results=max_observations)
+        # Use a moderate radius — large enough to catch offset pointings, small
+        # enough to avoid pulling in hundreds of unrelated observations.
+        obs = search_by_coordinates(
+            ra, dec,
+            radius_arcmin=min(search_radius_arcmin, 5.0),
+            instrument=instrument,
+            max_results=max_observations,
+        )
 
     if len(obs) == 0:
         console.print(f"[red]No JWST {instrument} observations found for '{target}'.[/]")
@@ -588,50 +601,99 @@ def fetch_rgb_set(
         console.print("[red]No public Level-3 products found.[/]")
         return None
 
-    # Discover which filters are available across all products
     filter_re = re.compile(r"[_-](f\d{3}[mwni])[_-]", re.IGNORECASE)
-    filter_to_products: dict[str, list] = {}
+    # Matches the association prefix: jw02731-o001_t017 — programme + target pointing.
+    # Files sharing this prefix cover the same field regardless of filter.
+    prefix_re = re.compile(r"^(jw\d+(?:-o\d+)?_t\d+)", re.IGNORECASE)
+    max_size_bytes = max_size_mb * 1_048_576
+
+    # Group products by field pointing (filename prefix) so all three channels
+    # come from the same sky footprint.
+    # Key = jw[prog]-o[obs]_t[tgt], value = {filter: [rows]}.
+    obs_groups: dict[str, dict[str, list]] = {}
     for row in products:
         fname = str(row["productFilename"])
-        m = filter_re.search(fname)
-        if m:
-            filt = m.group(1).upper()
-            filter_to_products.setdefault(filt, []).append(row)
+        fm = filter_re.search(fname)
+        pm = prefix_re.match(fname)
+        if not fm or not pm:
+            continue
+        filt = fm.group(1).upper()
+        pointing = pm.group(1).lower()
+        obs_groups.setdefault(pointing, {}).setdefault(filt, []).append(row)
 
-    available = list(filter_to_products.keys())
-    console.print(
-        f"Found [bold]{len(available)}[/] filter(s): "
-        + "  ".join(f"[yellow]{f}[/]" for f in sorted(available, key=_filter_wavelength))
-    )
-
-    triplet = _best_rgb_triplet(available, presets)
-    if triplet is None:
-        console.print(
-            f"[red]Need ≥ 3 filters for RGB; only {len(available)} available.[/]"
-        )
+    if not obs_groups:
+        console.print("[red]No filter-tagged i2d products found.[/]")
         return None
 
-    red_f, green_f, blue_f = triplet
+    # Score each observation group: prefer groups where the selected triplet
+    # has all files under max_size_mb, then prefer widest wavelength spread.
+    best_obs_id: Optional[str] = None
+    best_triplet: Optional[tuple[str, str, str]] = None
+    best_score = -1
+
+    for obs_id, f2rows in obs_groups.items():
+        # Prefer filters with at least one file under the size cap
+        small_filters = [
+            f for f, rows in f2rows.items()
+            if any(int(r["size"] or 0) < max_size_bytes for r in rows)
+        ]
+        candidate_filters = small_filters if len(small_filters) >= 3 else list(f2rows.keys())
+        triplet = _best_rgb_triplet(candidate_filters, presets)
+        if triplet is None:
+            continue
+        r, g, b = triplet
+        spread = _filter_wavelength(r) - _filter_wavelength(b)
+        # Bonus if all three channels are within the size cap
+        size_ok = all(
+            any(int(row["size"] or 0) < max_size_bytes for row in f2rows[f])
+            for f in triplet
+        )
+        score = spread + (10_000 if size_ok else 0)
+        if score > best_score:
+            best_score = score
+            best_obs_id = obs_id
+            best_triplet = triplet
+
+    if best_triplet is None or best_obs_id is None:
+        console.print("[red]Could not find an observation with ≥ 3 usable filters.[/]")
+        return None
+
+    filter_to_products = obs_groups[best_obs_id]
+    all_filters = sorted(filter_to_products.keys(), key=_filter_wavelength)
+    console.print(
+        f"Using observation [dim]{best_obs_id}[/] — "
+        f"[bold]{len(all_filters)}[/] filter(s): "
+        + "  ".join(f"[yellow]{f}[/]" for f in all_filters)
+    )
+
+    red_f, green_f, blue_f = best_triplet
     console.print(
         f"\n[bold]Selected palette:[/] "
         f"[red]{red_f}[/] = R   [green]{green_f}[/] = G   [blue]{blue_f}[/] = B"
     )
 
-    # Download one file per channel (largest i2d by size)
+    # Download one file per channel — smallest file under the size cap,
+    # falling back to the smallest overall if all exceed the cap.
     dest_dir.mkdir(parents=True, exist_ok=True)
     channel_paths: list[Path] = []
     for filt in (red_f, green_f, blue_f):
         rows = filter_to_products[filt]
-        # Pick the largest file (most pixels = best mosaic)
-        best = max(rows, key=lambda r: int(r["size"]) if r["size"] else 0)
+        under_cap = [r for r in rows if int(r["size"] or 0) < max_size_bytes]
+        pool = under_cap if under_cap else rows
+        best = max(pool, key=lambda r: int(r["size"]) if r["size"] else 0)
         fname = str(best["productFilename"])
+        size_mb = int(best["size"] or 0) // 1_048_576
         dest_path = dest_dir / fname
-        if dest_path.exists():
+
+        if dest_path.exists() and dest_path.stat().st_size >= int(best["size"] or 0) * 0.99:
             console.print(f"  [dim]Cached[/]   [{filt}] {fname}")
             channel_paths.append(dest_path)
             continue
+        elif dest_path.exists():
+            console.print(f"  [yellow]Resuming[/] [{filt}] {fname} (truncated, re-downloading)")
+            dest_path.unlink()
 
-        console.print(f"  Downloading [{filt}] {fname}…")
+        console.print(f"  Downloading [{filt}] {fname} ({size_mb} MB)…")
         try:
             result = Observations.download_file(best["dataURI"], local_path=str(dest_path))
             if result[0] == "COMPLETE":
