@@ -487,3 +487,161 @@ def fetch(
     console.print(f"Found [bold]{len(products)}[/] science products.")
 
     return download_products(products, dest_dir, filters=filters)
+
+
+# ---------------------------------------------------------------------------
+# RGB filter-set fetch
+# ---------------------------------------------------------------------------
+
+# Preferred NIRCam RGB filter triplets, ordered by scientific popularity.
+# Each tuple is (red_filter, green_filter, blue_filter) by wavelength.
+# Wavelength encoded in filter name: F444W = 4.44 µm, F090W = 0.90 µm.
+_NIRCAM_RGB_PRESETS: list[tuple[str, str, str]] = [
+    ("F444W", "F277W", "F090W"),   # classic deep-field palette (Cosmic Cliffs etc.)
+    ("F444W", "F277W", "F115W"),   # good when F090W not observed
+    ("F356W", "F200W", "F090W"),   # shorter wavelengths — bluer result
+    ("F444W", "F335M", "F115W"),   # medium-band for sharper colour contrast
+    ("F470N", "F335M", "F187N"),   # narrow-band Pillars-of-Creation palette
+    ("F444W", "F277W", "F150W"),   # alternative blue substitution
+]
+
+_MIRI_RGB_PRESETS: list[tuple[str, str, str]] = [
+    ("F2100W", "F1130W", "F770W"),
+    ("F1800W", "F1130W", "F560W"),
+]
+
+
+def _filter_wavelength(name: str) -> int:
+    """Return the approximate wavelength in nm encoded in a JWST filter name.
+
+    E.g. ``F444W`` → 4440, ``F090W`` → 900.
+    """
+    m = re.match(r"F(\d+)[MWNI]", name.strip(), re.IGNORECASE)
+    return int(m.group(1)) * 10 if m else 0
+
+
+def _best_rgb_triplet(
+    available_filters: list[str],
+    presets: list[tuple[str, str, str]],
+) -> Optional[tuple[str, str, str]]:
+    """Return the first preset triplet whose three filters are all available.
+
+    Falls back to automatically choosing the three most-separated filters
+    by wavelength if no preset matches.
+    """
+    upper = {f.upper() for f in available_filters}
+
+    # Try presets first (known-good palettes)
+    for red, green, blue in presets:
+        if {red, green, blue}.issubset(upper):
+            return red, green, blue
+
+    # Auto-select: pick three filters maximally spread in wavelength
+    if len(upper) < 3:
+        return None
+    sorted_f = sorted(upper, key=_filter_wavelength)
+    if len(sorted_f) == 3:
+        return sorted_f[2], sorted_f[1], sorted_f[0]
+    # More than 3: pick shortest, middle, longest
+    mid = sorted_f[len(sorted_f) // 2]
+    return sorted_f[-1], mid, sorted_f[0]
+
+
+def fetch_rgb_set(
+    target: str,
+    dest_dir: Path,
+    instrument: str = "NIRCam",
+    max_observations: int = 10,
+) -> Optional[tuple[Path, Path, Path]]:
+    """Fetch a three-filter set for *target* and return (red, green, blue) paths.
+
+    Searches for JWST observations of *target* (using the same name-resolution
+    logic as :func:`fetch`), selects the observation with the most filters, then
+    downloads the three filters that best span the available wavelength range.
+
+    Returns ``None`` if fewer than three filter bands are available.
+    """
+    presets = _MIRI_RGB_PRESETS if "miri" in instrument.lower() else _NIRCAM_RGB_PRESETS
+
+    # Find observations
+    obs = search_observations(target, instrument=instrument, max_results=max_observations)
+    if len(obs) == 0:
+        console.print(f"[dim]No results by name — trying Simbad resolution for '{target}'…[/]")
+        coords = resolve_target(target)
+        if coords is None:
+            console.print(
+                f"[red]Could not resolve '{target}' via Simbad.[/] "
+                "Try a catalog name (e.g. 'M16', 'NGC 3324')."
+            )
+            return None
+        ra, dec = coords
+        console.print(f"[dim]Resolved to RA={ra:.4f} Dec={dec:.4f}[/]")
+        obs = search_by_coordinates(ra, dec, instrument=instrument, max_results=max_observations)
+
+    if len(obs) == 0:
+        console.print(f"[red]No JWST {instrument} observations found for '{target}'.[/]")
+        return None
+
+    # Get all public i2d products
+    products = get_best_products(obs, public_only=True)
+    if len(products) == 0:
+        console.print("[red]No public Level-3 products found.[/]")
+        return None
+
+    # Discover which filters are available across all products
+    filter_re = re.compile(r"[_-](f\d{3}[mwni])[_-]", re.IGNORECASE)
+    filter_to_products: dict[str, list] = {}
+    for row in products:
+        fname = str(row["productFilename"])
+        m = filter_re.search(fname)
+        if m:
+            filt = m.group(1).upper()
+            filter_to_products.setdefault(filt, []).append(row)
+
+    available = list(filter_to_products.keys())
+    console.print(
+        f"Found [bold]{len(available)}[/] filter(s): "
+        + "  ".join(f"[yellow]{f}[/]" for f in sorted(available, key=_filter_wavelength))
+    )
+
+    triplet = _best_rgb_triplet(available, presets)
+    if triplet is None:
+        console.print(
+            f"[red]Need ≥ 3 filters for RGB; only {len(available)} available.[/]"
+        )
+        return None
+
+    red_f, green_f, blue_f = triplet
+    console.print(
+        f"\n[bold]Selected palette:[/] "
+        f"[red]{red_f}[/] = R   [green]{green_f}[/] = G   [blue]{blue_f}[/] = B"
+    )
+
+    # Download one file per channel (largest i2d by size)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    channel_paths: list[Path] = []
+    for filt in (red_f, green_f, blue_f):
+        rows = filter_to_products[filt]
+        # Pick the largest file (most pixels = best mosaic)
+        best = max(rows, key=lambda r: int(r["size"]) if r["size"] else 0)
+        fname = str(best["productFilename"])
+        dest_path = dest_dir / fname
+        if dest_path.exists():
+            console.print(f"  [dim]Cached[/]   [{filt}] {fname}")
+            channel_paths.append(dest_path)
+            continue
+
+        console.print(f"  Downloading [{filt}] {fname}…")
+        try:
+            result = Observations.download_file(best["dataURI"], local_path=str(dest_path))
+            if result[0] == "COMPLETE":
+                console.print(f"  [green]✓[/] {fname}")
+                channel_paths.append(dest_path)
+            else:
+                console.print(f"  [red]Failed[/] {fname}: {result[1]}")
+                return None
+        except Exception as exc:
+            console.print(f"  [red]Error[/] {fname}: {exc}")
+            return None
+
+    return channel_paths[0], channel_paths[1], channel_paths[2]

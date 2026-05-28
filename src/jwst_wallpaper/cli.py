@@ -323,15 +323,53 @@ def fetch(
     target: str = typer.Argument(..., help="Target name or object (e.g. 'Carina Nebula')."),
     instrument: str = typer.Option("NIRCam", "-i", "--instrument",
                                    help="JWST instrument: NIRCam, MIRI, NIRSpec, NIRISS."),
-    max_obs: int = typer.Option(5, "-n", "--max-obs",
+    max_obs: int = typer.Option(10, "-n", "--max-obs",
                                 help="Max observations to query."),
     filters: Optional[list[str]] = typer.Option(None, "-f", "--filter",
                                                   help="Only download files matching these filter names (repeatable)."),
+    rgb: bool = typer.Option(False, "--rgb",
+                             help="Fetch a 3-filter set and immediately render a full-colour Lupton RGB wallpaper."),
+    no_set: bool = typer.Option(False, "--no-set", help="Skip setting the wallpaper (only with --rgb)."),
 ) -> None:
-    """Download FITS images for TARGET from the MAST archive."""
+    """Download FITS images for TARGET from the MAST archive.
+
+    With [bold]--rgb[/], automatically selects the best 3-filter combination,
+    downloads one mosaic per channel, composites them with the Lupton algorithm,
+    and sets the result as your wallpaper.
+    """
     loaded_cfg = cfg_module.load()
     dest = cfg_module.fits_dir()
 
+    # ── RGB shortcut ──────────────────────────────────────────────────────────
+    if rgb:
+        result = mast.fetch_rgb_set(
+            target=target,
+            dest_dir=dest,
+            instrument=instrument,
+            max_observations=max_obs,
+        )
+        if result is None:
+            console.print("[red]Could not assemble a 3-filter RGB set.[/]")
+            raise typer.Exit(1)
+
+        red_path, green_path, blue_path = result
+        for p in (red_path, green_path, blue_path):
+            entry = cache.entry_from_fits(p, target=target, instrument=instrument)
+            cache.add_entry(entry)
+
+        console.print("\nRendering Lupton RGB composite…")
+        out = renderer.render_lupton_rgb(red_path, green_path, blue_path, loaded_cfg)
+        console.print(f"[green]RGB wallpaper saved:[/] {out}")
+
+        if not no_set:
+            try:
+                wallpaper.set_wallpaper(out)
+                console.print("[green]✓ Wallpaper set.[/]")
+            except (wallpaper.WallpaperError, FileNotFoundError) as exc:
+                console.print(f"[yellow]Warning — could not set wallpaper:[/] {exc}")
+        return
+
+    # ── Single-band / multi-file fetch ────────────────────────────────────────
     paths = mast.fetch(
         target=target,
         dest_dir=dest,
@@ -384,9 +422,13 @@ def render(
 
     if rgb:
         if not (red and green and blue):
-            console.print("[red]--rgb requires --red, --green, and --blue FITS files.[/]")
+            console.print(
+                "[red]--rgb requires --red, --green, and --blue FITS files.[/]\n"
+                "[dim]Tip: use [cyan]fetch --rgb <target>[/] to download & render in one step.[/]"
+            )
             raise typer.Exit(1)
-        out = renderer.render_rgb(red, green, blue, loaded_cfg)
+        console.print("Rendering Lupton RGB composite…")
+        out = renderer.render_lupton_rgb(red, green, blue, loaded_cfg)
         console.print(f"[green]RGB wallpaper rendered:[/] {out}")
         return
 
