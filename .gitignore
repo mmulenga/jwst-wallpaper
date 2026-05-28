@@ -32,6 +32,7 @@ htmlcov/
 *.jpg
 *.jpeg
 !tests/fixtures/
+!images/*.png
 
 # OS
 .DS_Store
