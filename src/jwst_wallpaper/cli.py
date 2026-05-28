@@ -406,6 +406,18 @@ def render(
     red: Optional[Path] = typer.Option(None, "--red", help="FITS file for red channel (RGB mode)."),
     green: Optional[Path] = typer.Option(None, "--green", help="FITS file for green channel."),
     blue: Optional[Path] = typer.Option(None, "--blue", help="FITS file for blue channel."),
+    lupton_q: Optional[float] = typer.Option(None, "--q",
+                                              help="Lupton Q softening (default 8; lower = richer colour)."),
+    lupton_stretch: Optional[float] = typer.Option(None, "--lupton-stretch",
+                                                    help="Lupton stretch scale (default 0.4; lower = more faint detail)."),
+    saturation: Optional[float] = typer.Option(None, "--saturation",
+                                               help="Colour saturation boost after Lupton (default 1.8; 1.0 = off)."),
+    r_gain: Optional[float] = typer.Option(None, "--r-gain",
+                                           help="Red channel gain after normalisation (default 0.85)."),
+    g_gain: Optional[float] = typer.Option(None, "--g-gain",
+                                           help="Green channel gain after normalisation (default 1.0)."),
+    b_gain: Optional[float] = typer.Option(None, "--b-gain",
+                                           help="Blue channel gain after normalisation (default 1.3)."),
 ) -> None:
     """Render a FITS file into a desktop wallpaper PNG."""
     loaded_cfg = cfg_module.load()
@@ -428,7 +440,20 @@ def render(
             )
             raise typer.Exit(1)
         console.print("Rendering Lupton RGB composite…")
-        out = renderer.render_lupton_rgb(red, green, blue, loaded_cfg)
+        rgb_kwargs: dict = {}
+        if lupton_q is not None:
+            rgb_kwargs["Q"] = lupton_q
+        if lupton_stretch is not None:
+            rgb_kwargs["stretch"] = lupton_stretch
+        if saturation is not None:
+            rgb_kwargs["saturation"] = saturation
+        if r_gain is not None:
+            rgb_kwargs["r_gain"] = r_gain
+        if g_gain is not None:
+            rgb_kwargs["g_gain"] = g_gain
+        if b_gain is not None:
+            rgb_kwargs["b_gain"] = b_gain
+        out = renderer.render_lupton_rgb(red, green, blue, loaded_cfg, **rgb_kwargs)
         console.print(f"[green]RGB wallpaper rendered:[/] {out}")
         return
 
