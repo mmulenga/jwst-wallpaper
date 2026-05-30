@@ -10,12 +10,46 @@ jwst-wallpaper run "Carina Nebula"
 
 ## Example output
 
-Carina Nebula "Cosmic Cliffs" (NGC 3324) — 3-filter Lupton RGB composite from raw JWST NIRCam FITS data.  
+### v34 — 5-filter composite (current)
+
+Carina Nebula "Cosmic Cliffs" (NGC 3324) — 5-filter Lupton RGB composite from raw JWST NIRCam FITS data, rendered at 3840×2160.
+
+![Carina Nebula 5-filter RGB composite v34](images/carina_nebula_5filter_v34.png)
+
+**Channel mapping:**
+
+| Output | Filters | Physical signal |
+|--------|---------|-----------------|
+| Red | F444W + 0.5×F335M | Warm dust thermal emission + PAH shoulder |
+| Green | F335M + 0.5×F187N | PAH polycyclic aromatic hydrocarbons + ionised H |
+| Blue | F090W + 0.5×F187N + F200W\* | Scattered blue starlight + ionised gas + stellar continuum |
+
+\*F200W normalised separately (gain=0.20) and added to blue to give stars a blue tint without contaminating the green channel.
+
+**Processing pipeline:** sky subtraction (10th-pct) → p99 normalisation with per-channel gains (R×1.60, G×0.80, B×0.60+0.20) → Lupton asinh stretch (Q=8, stretch=0.30) → S-curve (strength=0.15) → gamma 0.82 → star whitening (threshold=0.68) → luminance-based targeted desaturation → orange→red dust filter (targeted G-reduction for G/B>1.5 pixels) → dark background hue lock → vertical flip (FITS→screen orientation).
+
+**Colour statistics vs NASA press-release reference:**
+
+| Region | R/G/B% | Hue | Sat | Notes |
+|--------|--------|-----|-----|-------|
+| Stars (val>0.80) | 37/32/31 | 12° | 0.375 | Target: 39/33/29, 17°, 0.361 |
+| Nebula (val 0.15–0.80) | 38/28/34 | 325° | 0.597 | Target: 37/29/33, 336°, 0.553 |
+| Background (val<0.15) | 34/29/38 | 286° | 0.201 | Target: 34/29/37, 271° |
+| **Overall R/G** | **1.260** | — | — | **Target: 1.260 ✓** |
+| **Overall B/G** | **1.102** | — | — | **Target: 1.105 ✓** |
+
+*Raw data: [JWST program 2731](https://www.stsci.edu/jwst/phase2-public/2731.pdf), retrieved from MAST. Colour tuned to match the [NASA/STScI Carina Nebula press-release image](https://science.nasa.gov/missions/webb/nasas-webb-captures-dying-star-s-final-performance-in-fine-detail/) across star hue, nebula saturation, background hue, and overall R/G and B/G ratios.*
+
+---
+
+### v1 — 3-filter composite (original)
+
+Carina Nebula "Cosmic Cliffs" (NGC 3324) — 3-filter Lupton RGB composite.  
 F444W → red · F200W → green · F090W → blue. Rendered at 3840×2160.
 
-![Carina Nebula RGB composite](images/carina_nebula_rgb.png)
+![Carina Nebula 3-filter RGB composite](images/carina_nebula_rgb.png)
 
-*Raw data: [JWST program 2731](https://www.stsci.edu/jwst/phase2-public/2731.pdf), retrieved from MAST. Color processing modelled on the [NASA press-release pipeline](https://science.nasa.gov/missions/webb/nasas-webb-captures-dying-star-s-final-performance-in-fine-detail/) using the Lupton et al. (2004) asinh stretch with a post-composite colour matrix to approximate the missing F187N and F335M filter contributions.*
+*Raw data: [JWST program 2731](https://www.stsci.edu/jwst/phase2-public/2731.pdf), retrieved from MAST.*
 
 ---
 
